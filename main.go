@@ -15,14 +15,15 @@ import (
 
 var (
 	anthropic_api_key = os.Getenv("ANTHROPIC_API_KEY")
-	token             = os.Getenv("TELEGRAM_AI_BOT_TOKEN")
+	tg_api_token      = os.Getenv("TELEGRAM_AI_BOT_API_TOKEN")
 	authorizedUsers   map[int64]bool
+	anthropic_client  *anthropic.Client
 )
 
 func main() {
-	bot, err := tgbotapi.NewBotAPI(token)
+	bot, err := tgbotapi.NewBotAPI(tg_api_token)
 	if err != nil {
-		log.Panic(err)
+        log.Panicf("Unable to connect to bot: %s", err.Error())
 	}
 
 	bot.Debug = true
@@ -50,9 +51,12 @@ func main() {
 }
 
 func init() {
-	log.Println("Executed init")
+	anthropic_client = anthropic.NewClient(
+		option.WithAPIKey(anthropic_api_key),
+	)
+
 	authorizedUsers = make(map[int64]bool)
-	if allowedUsers := os.Getenv("AI_AGENT_ALLOWED_USERS"); allowedUsers != "" {
+	if allowedUsers := os.Getenv("TELEGRAM_AI_BOT_ALLOWED_USERS"); allowedUsers != "" {
 		for _, userIDRaw := range strings.Split(allowedUsers, ",") {
 			userID := strings.Trim(userIDRaw, " ")
 			if id, err := strconv.ParseInt(userID, 10, 64); err == nil {
@@ -63,13 +67,9 @@ func init() {
 }
 
 func forwardToAnthropic(tgMessage *tgbotapi.Message) string {
-	client := anthropic.NewClient(
-		option.WithAPIKey(anthropic_api_key),
-	)
-
-	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+	message, err := anthropic_client.Messages.New(context.TODO(), anthropic.MessageNewParams{
 		Model:     anthropic.F(anthropic.ModelClaude3_5SonnetLatest),
-		MaxTokens: anthropic.F(int64(2048)),
+		MaxTokens: anthropic.F(int64(1024)),
 		Messages: anthropic.F([]anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(tgMessage.Text)),
 		}),
