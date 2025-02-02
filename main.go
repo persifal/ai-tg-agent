@@ -114,7 +114,6 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		anthropicResponseContent = "Empty response from provider"
 	} else if respLen > 4096 {
 		// TODO slice it
-		// TODO nvim must hightlight TODO word
 		anthropicResponseContent = "Response is too big"
 	}
 
