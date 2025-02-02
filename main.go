@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -23,7 +25,7 @@ var (
 func main() {
 	bot, err := tgbotapi.NewBotAPI(tg_api_token)
 	if err != nil {
-        log.Panicf("Unable to connect to bot: %s", err.Error())
+		log.Panicf("Unable to connect to bot: %s", err.Error())
 	}
 
 	bot.Debug = true
@@ -51,9 +53,7 @@ func main() {
 }
 
 func init() {
-	anthropic_client = anthropic.NewClient(
-		option.WithAPIKey(anthropic_api_key),
-	)
+	anthropic_client = initAnthropicClient()
 
 	authorizedUsers = make(map[int64]bool)
 	if allowedUsers := os.Getenv("TELEGRAM_AI_BOT_ALLOWED_USERS"); allowedUsers != "" {
@@ -64,6 +64,24 @@ func init() {
 			}
 		}
 	}
+}
+
+func initAnthropicClient() *anthropic.Client {
+	proxyURL, err := url.Parse(os.Getenv("ANTHROPIC_PROXY"))
+	if err != nil {
+		log.Fatal("Invalid proxy URL:", err)
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	return anthropic.NewClient(
+		option.WithAPIKey(anthropic_api_key),
+		option.WithHTTPClient(httpClient),
+	)
 }
 
 func forwardToAnthropic(tgMessage *tgbotapi.Message) string {
@@ -91,8 +109,13 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 
 	setChatTyping(message.Chat.ID, bot)
 	anthropicResponseContent := forwardToAnthropic(message)
-	if len(anthropicResponseContent) == 0 {
+	respLen := len(anthropicResponseContent)
+	if respLen == 0 {
 		anthropicResponseContent = "Empty response from provider"
+	} else if respLen > 4096 {
+		// TODO slice it
+		// TODO nvim must hightlight TODO word
+		anthropicResponseContent = "Response is too big"
 	}
 
 	msg := tgbotapi.NewMessage(message.Chat.ID, anthropicResponseContent)
