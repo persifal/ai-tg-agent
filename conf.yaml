@@ -1,0 +1,10 @@
+anthropic:
+  key: pass
+  proxy:
+    enabled: pass
+    url: pass
+
+bot:
+  key: pass
+  whitelist:
+    - pass
