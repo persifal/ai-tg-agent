@@ -2,115 +2,111 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"gopkg.in/yaml.v3"
 )
 
-type Conf struct {
-	Bot struct {
-		Key       string   `yaml:"key"`
-		Whitelist []string `yaml:"whitelist"`
-	} `yaml:"bot"`
-	Anthropic struct {
-		Key   string `yaml:"key"`
-		Proxy struct {
-			Enabled bool   `yaml:"enabled"`
-			Url     string `yaml:"url"`
-		} `yaml:"proxy"`
-	} `yaml:"anthropic"`
-}
+var (
+	tg              *tgbotapi.BotAPI
+	anth            *anthropic.Client
+	authorizedUsers *AuthorizedUsers
+	conf            *Conf
+	repo            *InMemoryConvRepo
+)
 
-func LoadConfig(path string) (*Conf, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, fmt.Errorf("error resolving config path: %w", err)
-	}
-
-	data, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading config file: %w", err)
-	}
-
-	config := &Conf{}
-
-	if err := yaml.Unmarshal(data, config); err != nil {
-		return nil, fmt.Errorf("error parsing yaml: %w", err)
-	}
-
-	if err := validate(config); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
-	}
-
-	return config, nil
-}
-
-func validate(config *Conf) error {
-	if config.Bot.Key == "" {
-		return fmt.Errorf("telegram token is required")
-	}
-	if len(config.Bot.Whitelist) == 0 {
-		return fmt.Errorf("whitelist is empty")
-	}
-	if config.Anthropic.Key == "" {
-		return fmt.Errorf("anthropic API key is required")
-	}
-
-	return nil
-}
-
-func main() {
-	conf, err := LoadConfig("conf.yaml")
+func init() {
+	config, err := NewConf()
 	if err != nil {
 		log.Fatalf("Unable to load conf.yaml, %v", err)
 	}
 
-	ctx := initCtx(conf)
+	tg = createTgClient(config)
+	anth = createAnthropicClient(config)
 
+	m := make(map[int64]bool)
+	for _, v := range config.Bot.Whitelist {
+		i, _ := strconv.Atoi(v)
+		m[int64(i)] = true
+	}
+
+	authorizedUsers = &AuthorizedUsers{users: m}
+	if config.Debug {
+		log.Printf("authorized users: %v", m)
+	}
+
+	repo = NewRepo()
+	conf = config
+}
+
+func main() {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
-	updates := ctx.tg.GetUpdatesChan(updateConfig)
+	updates := tg.GetUpdatesChan(updateConfig)
 
 	for update := range updates {
 		if update.Message == nil {
 			continue
 		}
 
-		go handleMessage(ctx, update.Message)
+		go handle(update.Message)
 	}
 }
 
-type Ctx struct {
-	tg              *tgbotapi.BotAPI
-	ai              *anthropic.Client
-	authorizedUsers map[int64]bool
+func handle(msg *tgbotapi.Message) {
+	setChatTyping(msg.Chat.ID)
+	if !authorizedUsers.contains(int64(msg.From.ID)) {
+		log.Printf("unauthorized access attempt from user ID: %d", msg.From.ID)
+		msg := tgbotapi.NewMessage(msg.Chat.ID, "sorry, you are not authorized to use this bot.")
+		send(&msg)
+		return
+	}
+
+	if msg.IsCommand() {
+		handleCommand(msg)
+	} else {
+		handleMessage(msg)
+	}
 }
 
-func initCtx(conf *Conf) *Ctx {
-	m := make(map[int64]bool)
-	for _, v := range conf.Bot.Whitelist {
-		i, _ := strconv.Atoi(v)
-		m[int64(i)] = true
+func handleCommand(msg *tgbotapi.Message) {
+	switch msg.Command() {
+	case "startdialog":
+		_, ok := repo.NewConversation(msg.Chat.ID)
+		if ok {
+			reply(msg, "conversation started")
+		} else {
+			reply(msg, "you already in conversation context")
+		}
+	case "enddialog":
+		repo.CloseConversation(msg.Chat.ID)
+		reply(msg, "conversation closed and context cleared")
+	default:
+		reply(msg, fmt.Sprintf("unknown command: %s", msg.Command()))
 	}
+}
 
-	fmt.Printf("Authorized users: %v", m)
+type AuthorizedUsers struct {
+	sync.RWMutex
+	users map[int64]bool
+}
 
-	ctx := &Ctx{
-		createTgClient(conf),
-		createAnthropicClient(conf),
-		m,
-	}
-
-	return ctx
+func (a *AuthorizedUsers) contains(id int64) bool {
+	a.RLock()
+	defer a.RUnlock()
+	return a.users[id]
 }
 
 func createTgClient(conf *Conf) *tgbotapi.BotAPI {
@@ -119,7 +115,7 @@ func createTgClient(conf *Conf) *tgbotapi.BotAPI {
 		log.Panicf("Unable to connect to bot: %s", err.Error())
 	}
 
-	tg.Debug = true
+	tg.Debug = conf.Debug
 
 	return tg
 }
@@ -147,10 +143,11 @@ func createAnthropicClient(conf *Conf) *anthropic.Client {
 	}
 }
 
-func forward(client *anthropic.Client, tgMsg *tgbotapi.Message) (*anthropic.Message, error) {
-	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+func forward(tgMsg *tgbotapi.Message) (*anthropic.Message, error) {
+	message, err := anth.Messages.New(context.Background(), anthropic.MessageNewParams{
 		Model:     anthropic.F(anthropic.ModelClaude3_5SonnetLatest),
-		MaxTokens: anthropic.F(int64(1024)),
+		MaxTokens: anthropic.F(int64(2048)),
+		System:    anthropic.F([]anthropic.TextBlockParam{anthropic.NewTextBlock(conf.Anthropic.System)}),
 		Messages: anthropic.F([]anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(tgMsg.Text)),
 		}),
@@ -162,77 +159,115 @@ func forward(client *anthropic.Client, tgMsg *tgbotapi.Message) (*anthropic.Mess
 	return message, nil
 }
 
-func handleMessage(ctx *Ctx, tgMsg *tgbotapi.Message) {
-	if !ctx.authorizedUsers[tgMsg.From.ID] {
-		log.Printf("Unauthorized access attempt from user ID: %d", tgMsg.From.ID)
-		msg := tgbotapi.NewMessage(tgMsg.Chat.ID, "Sorry, you are not authorized to use this bot.")
-		ctx.tg.Send(msg)
-		return
+func conversationForward(msg *tgbotapi.Message) (*anthropic.Message, error) {
+	conv, ok := repo.Get(msg.Chat.ID)
+	if !ok {
+		return nil, errors.New("conversation is not started")
 	}
 
-	setChatTyping(tgMsg.Chat.ID, ctx.tg)
-	aiMsg, err := forward(ctx.ai, tgMsg)
-	contents := make([]string, 0)
+	userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Text))
+	repo.AddMessage(msg.Chat.ID, userMessage)
+
+	response, err := anth.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.F(anthropic.ModelClaude3_5SonnetLatest),
+		MaxTokens: anthropic.F(int64(4096)),
+		Messages:  anthropic.F(conv.history),
+		System:    anthropic.F([]anthropic.TextBlockParam{anthropic.NewTextBlock(conf.Anthropic.System)}),
+	})
 	if err != nil {
-		contents = append(contents, err.Error())
-		replyTo(tgMsg.Chat.ID, int64(tgMsg.MessageID), contents, ctx.tg)
-		return
+		return nil, fmt.Errorf("forward finished with error: %s", err.Error())
 	}
 
-	for _, v := range aiMsg.Content {
-		text := v.Text
-		vLen := len(text)
-		if vLen == 0 {
-			contents = []string{
-				fmt.Sprintf("Empty response from provider with %d len contents", vLen),
-			}
-			break
-		} else if vLen > 4096 {
-			contents = append(contents, slice(text)...)
-		} else {
-			contents = append(contents, text)
-		}
-	}
-
-	replyTo(tgMsg.Chat.ID, int64(tgMsg.MessageID), contents, ctx.tg)
+	repo.AddMessage(msg.Chat.ID, response.ToParam())
+	return response, nil
 }
 
-func slice(text string) []string {
-	l := len(text)
-	r := make([]string, 0)
-	p := 0
-	for p < l {
-		s := text[p:min(p+4096, l)]
-		r = append(r, s)
-		p += 4096
+func handleMessage(tgMsg *tgbotapi.Message) {
+	var anthMsg *anthropic.Message
+	var err error
+	if repo.Exists(tgMsg.Chat.ID) {
+		anthMsg, err = conversationForward(tgMsg)
+	} else {
+		anthMsg, err = forward(tgMsg)
 	}
 
-	return r
+	if err != nil {
+		reply(tgMsg, fmt.Sprintf("error response from anthropic: %s", err.Error()))
+		return
+	}
+
+	if anthMsg != nil {
+		var sb strings.Builder
+		for _, c := range anthMsg.Content {
+			if c.Type == "text" {
+				sb.WriteString(c.Text)
+			} else {
+				sb.WriteString(fmt.Sprintf("$%s$", c.Type))
+			}
+		}
+
+		reply(tgMsg, sb.String())
+	} else {
+		log.Printf("should not happen but no errors and no anthropic response found.")
+		reply(tgMsg, "no errors and no anthropic response found =O")
+	}
+}
+
+func reply(msg *tgbotapi.Message, content string) {
+	slices := slice(content)
+	messageID := msg.MessageID
+	var reply tgbotapi.MessageConfig
+	for _, v := range slices {
+		reply = tgbotapi.NewMessage(msg.Chat.ID, v)
+		reply.ReplyToMessageID = messageID
+		sent := send(&reply)
+		messageID = sent.MessageID
+	}
+}
+
+func slice(content string) []string {
+	l := float64(utf8.RuneCountInString(content))
+	mx := float64(conf.Bot.MaxContentLen)
+	d := l / mx
+
+	if d > 1 {
+		parts := int(math.Ceil(d))
+		average := int(math.Ceil(l / float64(parts)))
+		result := make([]string, 0, parts)
+
+		runes := []rune(content)
+		w := 0
+		for i := 0; i < parts; i++ {
+			end := min(w+average, len(runes))
+			result = append(result, string(runes[w:end]))
+			w += average
+		}
+
+		return result
+	}
+
+	return []string{content}
 }
 
 func min(a, b int) int {
-	if a < b {
-		return a
-	} else {
+	if a > b {
 		return b
+	} else {
+		return a
 	}
 }
 
-func replyTo(chatId, replyId int64, contents []string, tg *tgbotapi.BotAPI) {
-	rep := replyId
-	for _, c := range contents {
-		msg := tgbotapi.NewMessage(chatId, c)
-		msg.ReplyToMessageID = int(rep)
-		sent, err := tg.Send(msg)
-		if err != nil {
-			log.Fatalf("telegram bot is unavailable '%v'", err.Error())
-		}
-
-		rep = int64(sent.MessageID)
+func send(msg *tgbotapi.MessageConfig) *tgbotapi.Message {
+	msg.ParseMode = "HTML"
+	sent, err := tg.Send(msg)
+	if err != nil {
+		log.Printf("telegram API is unavailable '%v'", err.Error())
 	}
+
+	return &sent
 }
 
-func setChatTyping(chatId int64, bot *tgbotapi.BotAPI) {
+func setChatTyping(chatId int64) {
 	action := tgbotapi.NewChatAction(chatId, tgbotapi.ChatTyping)
-	bot.Send(action)
+	tg.Send(action)
 }

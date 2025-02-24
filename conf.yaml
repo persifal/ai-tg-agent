@@ -1,10 +1,13 @@
+debug: 
+
 anthropic:
-  key: pass
+  system: 
+  key: 
   proxy:
-    enabled: pass
-    url: pass
+    enabled: 
+    url: 
 
 bot:
-  key: pass
+  key: 
+  max-content-len: 
   whitelist:
-    - pass
