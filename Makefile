@@ -16,12 +16,15 @@ clean:
 	@rm -f ${BINARY_NAME}
 	@go clean
 
-docker-build:
+docker-image:
 	@echo "Building Docker image..."
 	docker build -t ${DOCKER_IMAGE} .
 
 docker-run:
-	docker run ${DOCKER_IMAGE}
+	docker run -d ${DOCKER_IMAGE}
+
+docker-stop:
+	docker stop $(docker ps -q --filter ancestor=${DOCKER_IMAGE} )
 
 run: build
 	./${BINARY_NAME}

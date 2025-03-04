@@ -69,8 +69,7 @@ func handle(msg *tgbotapi.Message) {
 	setChatTyping(msg.Chat.ID)
 	if !authorizedUsers.contains(int64(msg.From.ID)) {
 		log.Printf("unauthorized access attempt from user ID: %d", msg.From.ID)
-		msg := tgbotapi.NewMessage(msg.Chat.ID, "sorry, you are not authorized to use this bot.")
-		send(&msg)
+		reply(msg, "sorry, you are not authorized to use this bot.")
 		return
 	}
 
@@ -214,17 +213,24 @@ func handleMessage(tgMsg *tgbotapi.Message) {
 }
 
 func reply(msg *tgbotapi.Message, content string) {
-	slices := slice(content)
+	formatted := NewConverter(content).Convert()
+	slices := slice(formatted)
 	messageID := msg.MessageID
 	var reply tgbotapi.MessageConfig
 	for _, v := range slices {
 		reply = tgbotapi.NewMessage(msg.Chat.ID, v)
 		reply.ReplyToMessageID = messageID
-		sent := send(&reply)
+		reply.ParseMode = "HTML"
+		sent, err := tg.Send(reply)
+		if err != nil {
+			log.Printf("telegram API is unavailable '%v'", err.Error())
+		}
+
 		messageID = sent.MessageID
 	}
 }
 
+// TODO smart slice
 func slice(content string) []string {
 	l := float64(utf8.RuneCountInString(content))
 	mx := float64(conf.Bot.MaxContentLen)
@@ -255,16 +261,6 @@ func min(a, b int) int {
 	} else {
 		return a
 	}
-}
-
-func send(msg *tgbotapi.MessageConfig) *tgbotapi.Message {
-	msg.ParseMode = "HTML"
-	sent, err := tg.Send(msg)
-	if err != nil {
-		log.Printf("telegram API is unavailable '%v'", err.Error())
-	}
-
-	return &sent
 }
 
 func setChatTyping(chatId int64) {
